@@ -23,9 +23,10 @@ def main() -> None:
                 running = False
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 running = False
+            simulation.handle_event(event)
 
         simulation.update(dt)
-        simulation.render(screen)
+        simulation.render(screen, clock.get_fps())
         pygame.display.flip()
 
     pygame.quit()
