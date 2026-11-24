@@ -1,6 +1,6 @@
 import math
 import pygame
-from entities import Ball, Pin, WallSegment
+from entities import Ball, Pin, WallSegment, OneWayGate, Spinner, SeesawTrapdoor, YakumonoRoulette
 from config import (
     GRAVITY,
     SUB_STEPS,
@@ -10,6 +10,10 @@ from config import (
     SURFACE_FRICTION,
     AIR_DRAG,
     SCREEN_WIDTH,
+    SCREEN_HEIGHT,
+    ARENA_CENTER_X,
+    ARENA_CENTER_Y,
+    ARENA_RADIUS,
     GRID_CELL_SIZE,
     SLEEP_SPEED_THRESHOLD,
     SLEEP_TIME_REQUIRED,
@@ -42,7 +46,7 @@ class SpatialGrid:
 
 
 class PhysicsEngine:
-    """Position-Based Dynamics (Verlet) solver managing gravity, pins, rails, dividers, and collisions."""
+    """Position-Based Dynamics (Verlet) solver managing circular arena, pins, spinners, seesaw door, and Yakumono."""
 
     def __init__(
         self,
@@ -54,6 +58,7 @@ class PhysicsEngine:
         surface_friction: float = SURFACE_FRICTION,
         air_drag: float = AIR_DRAG,
         screen_width: float = float(SCREEN_WIDTH),
+        screen_height: float = float(SCREEN_HEIGHT),
         use_spatial_grid: bool = True,
         sleep_speed_threshold: float = SLEEP_SPEED_THRESHOLD,
         sleep_time_required: float = SLEEP_TIME_REQUIRED,
@@ -66,29 +71,42 @@ class PhysicsEngine:
         self.surface_friction: float = surface_friction
         self.air_drag: float = air_drag
         self.screen_width: float = screen_width
+        self.screen_height: float = screen_height
         self.use_spatial_grid: bool = use_spatial_grid
         self.sleep_speed_threshold: float = sleep_speed_threshold
         self.sleep_time_required: float = sleep_time_required
+
+        self.arena_cx: float = ARENA_CENTER_X
+        self.arena_cy: float = ARENA_CENTER_Y
+        self.arena_radius: float = ARENA_RADIUS
+
         self.grid: SpatialGrid = SpatialGrid()
         self.pins: list[Pin] = []
+        self.spinners: list[Spinner] = []
         self.walls: list[WallSegment] = []
-        self.divider_x_coords: list[float] = []
+        self.gate: OneWayGate | None = None
+        self.seesaw: SeesawTrapdoor | None = None
+        self.yakumono: YakumonoRoulette | None = None
 
-    def update(self, balls: list[Ball], dt: float) -> None:
+    def update(self, balls: list[Ball], dt: float, exclude_ball: Ball | None = None) -> None:
         """Advance simulation using Position-Based Dynamics across discrete sub-steps."""
         if dt <= 0.0 or not balls:
+            return
+
+        active_balls = [b for b in balls if b is not exclude_ball]
+        if not active_balls:
             return
 
         sub_dt = dt / float(self.sub_steps)
         gravity_step = self.gravity * sub_dt * sub_dt
 
         for _ in range(self.sub_steps):
-            self._sub_step(balls, sub_dt, gravity_step)
+            self._sub_step(active_balls, sub_dt, gravity_step)
 
-        self._update_sleep_states(balls, dt, sub_dt)
+        self._update_sleep_states(active_balls, dt, sub_dt)
 
     def _sub_step(self, balls: list[Ball], sub_dt: float, gravity_step: float) -> None:
-        """Execute one Verlet PBD integration step for positions, pin bounces, contacts, and bounds."""
+        """Execute one Verlet PBD integration step across all bodies, obstacles, and secret doors."""
         # 1. Integrate position using Verlet displacement with air drag and gravity
         for b in balls:
             if not b.is_sleeping:
@@ -98,24 +116,235 @@ class PhysicsEngine:
                 b.x += vx
                 b.y += vy
 
-        # 2. Solve static pin deflections
+        # 2. Solve static circular arena outer containment
+        self._resolve_circular_arena(balls, sub_dt)
+
+        # 3. Solve static pin deflections
         self._resolve_pin_collisions(balls, self.pins, sub_dt)
 
-        # 3. Solve inter-ball collisions with cascade wake-up
+        # 4. Solve rotating flower spinner kicks and deflections
+        self._resolve_spinner_collisions(balls, self.spinners, sub_dt)
+
+        # 5. Solve Seesaw Secret Door blocking beam (only when closed)
+        if self.seesaw is not None:
+            seesaw_seg = self.seesaw.get_wall_segment()
+            if seesaw_seg is not None:
+                self._resolve_wall_collisions(balls, [seesaw_seg], sub_dt)
+
+        # 6. Solve central Yakumono dome bumper collisions (outside top funnel)
+        if self.yakumono is not None:
+            self._resolve_yakumono_collision(balls, self.yakumono, sub_dt)
+
+        # 7. Solve rigid wall segments (shooter lane, dividers, guides)
+        self._resolve_wall_collisions(balls, self.walls, sub_dt)
+
+        # 8. Solve directional one-way brass gate
+        if self.gate is not None:
+            self._resolve_gate_collision(balls, self.gate, sub_dt)
+
+        # 9. Solve inter-ball collisions with cascade wake-up
         if self.use_spatial_grid:
             self._resolve_collisions_spatial(balls, sub_dt)
         else:
             self._resolve_collisions_naive(balls, sub_dt)
 
-        # 4. Solve rigid line-segment containment walls (angled side rails)
-        self._resolve_wall_collisions(balls, self.walls, sub_dt)
-
-        # 5. Solve vertical channel dividers and screen boundaries
-        self._resolve_divider_collisions(balls, sub_dt)
+        # 10. Absolute boundary fallback
         self._resolve_boundary_collisions(balls, sub_dt)
 
+    def _resolve_circular_arena(self, balls: list[Ball], sub_dt: float) -> None:
+        """Confine dynamic bodies within circular cabinet boundary, respecting shooter entry and drain gaps."""
+        cx = self.arena_cx
+        cy = self.arena_cy
+        r = self.arena_radius
+        refl_factor = 1.0 + self.wall_restitution
+
+        for ball in balls:
+            if ball.is_sleeping:
+                continue
+
+            dx = ball.x - cx
+            dy = ball.y - cy
+            dist_sq = dx * dx + dy * dy
+            limit_r = r - ball.radius
+
+            if dist_sq < limit_r * limit_r:
+                continue
+
+            # Allow ball to enter via top-left entrance opening
+            if ball.y < cy - 250.0 and (ball.x < cx - 40.0):
+                continue
+
+            # Allow ball to exit through bottom-center drain hole
+            if ball.y > cy + r - 35.0 and abs(ball.x - cx) < 46.0:
+                continue
+
+            dist = math.sqrt(dist_sq) if dist_sq > 1e-8 else 1e-4
+            inv_dist = 1.0 / dist
+            nx = dx * inv_dist
+            ny = dy * inv_dist
+
+            overlap = dist - limit_r
+            ball.x -= nx * overlap
+            ball.y -= ny * overlap
+
+            vx = ball.x - ball.old_x
+            vy = ball.y - ball.old_y
+            vn = vx * nx + vy * ny
+
+            if vn > 0.0:
+                refl_mag = -refl_factor * vn
+                ball.old_x -= nx * refl_mag
+                ball.old_y -= ny * refl_mag
+
+            tx = -ny
+            ty = nx
+            vt = vx * tx + vy * ty
+            fric_shift = vt * self.surface_friction
+            ball.old_x += tx * fric_shift
+            ball.old_y += ty * fric_shift
+
+    def _resolve_yakumono_collision(self, balls: list[Ball], yak: YakumonoRoulette, sub_dt: float) -> None:
+        """Resolve dynamic bounces off the central Yakumono dome, keeping the top funnel open for entry."""
+        for ball in balls:
+            if ball.is_sleeping:
+                continue
+
+            # Top funnel receptor opening (accessible when door is open)
+            if ball.y < yak.y - 25.0 and abs(ball.x - yak.x) < 30.0:
+                continue
+
+            dx = ball.x - yak.x
+            dy = ball.y - yak.y
+            min_dist = yak.radius + ball.radius
+            dist_sq = dx * dx + dy * dy
+
+            if dist_sq >= min_dist * min_dist or dist_sq <= 1e-8:
+                continue
+
+            dist = math.sqrt(dist_sq)
+            inv_dist = 1.0 / dist
+            nx = dx * inv_dist
+            ny = dy * inv_dist
+            overlap = min_dist - dist
+
+            ball.x += nx * overlap
+            ball.y += ny * overlap
+
+            vx = ball.x - ball.old_x
+            vy = ball.y - ball.old_y
+            vn = vx * nx + vy * ny
+
+            if vn < 0.0:
+                refl_mag = -(1.0 + self.pin_restitution) * vn
+                ball.old_x -= nx * refl_mag
+                ball.old_y -= ny * refl_mag
+
+            tx = -ny
+            ty = nx
+            vt = vx * tx + vy * ty
+            fric_shift = vt * self.surface_friction
+            ball.old_x += tx * fric_shift
+            ball.old_y += ty * fric_shift
+
+    def _resolve_spinner_collisions(self, balls: list[Ball], spinners: list[Spinner], sub_dt: float) -> None:
+        """Resolve dynamic collisions against rotating flower wheels with spin deflection."""
+        if not balls or not spinners:
+            return
+
+        for ball in balls:
+            if ball.is_sleeping:
+                continue
+
+            bx = ball.x
+            by = ball.y
+            br = ball.radius
+
+            for sp in spinners:
+                dx = bx - sp.x
+                dy = by - sp.y
+                min_dist = br + sp.radius
+
+                if abs(dx) > min_dist or abs(dy) > min_dist:
+                    continue
+
+                dist_sq = dx * dx + dy * dy
+                if dist_sq >= min_dist * min_dist:
+                    continue
+
+                dist = math.sqrt(dist_sq) if dist_sq > 1e-8 else 1e-4
+                inv_dist = 1.0 / dist
+                nx = dx * inv_dist
+                ny = dy * inv_dist
+
+                overlap = min_dist - dist
+                ball.x += nx * overlap
+                ball.y += ny * overlap
+
+                vx = ball.x - ball.old_x
+                vy = ball.y - ball.old_y
+                vn = vx * nx + vy * ny
+
+                if vn < 0.0:
+                    refl_mag = -(1.0 + self.wall_restitution) * vn
+                    ball.old_x -= nx * refl_mag
+                    ball.old_y -= ny * refl_mag
+
+                tx = -ny
+                ty = nx
+                vt = vx * tx + vy * ty
+
+                spin_impulse = vt * 0.35
+                if abs(spin_impulse) < 2.0:
+                    spin_impulse = 18.0 if (dx * vy - dy * vx) >= 0.0 else -18.0
+                sp.angular_vel = max(-45.0, min(45.0, sp.angular_vel + spin_impulse))
+
+                spin_kick = sp.angular_vel * sp.radius * 0.06
+                ball.old_x -= tx * spin_kick
+                ball.old_y -= ty * spin_kick
+
+    def _resolve_gate_collision(self, balls: list[Ball], gate: OneWayGate, sub_dt: float) -> None:
+        """Allow counter-clockwise entrance into the arena while acting as a rigid block against backward exit."""
+        refl_factor = 1.0 + self.wall_restitution
+
+        for ball in balls:
+            if ball.is_sleeping:
+                continue
+
+            vx = ball.x - ball.old_x
+            if vx < -1.0:
+                continue
+
+            wpx = ball.x - gate.x1
+            wpy = ball.y - gate.y1
+            t = max(0.0, min(1.0, (wpx * gate.dx + wpy * gate.dy) * gate.inv_len_sq))
+
+            cx = gate.x1 + t * gate.dx
+            cy = gate.y1 + t * gate.dy
+            sep_x = ball.x - cx
+            sep_y = ball.y - cy
+            dist_sq = sep_x * sep_x + sep_y * sep_y
+
+            if dist_sq >= ball.radius * ball.radius:
+                continue
+
+            dist = math.sqrt(dist_sq) if dist_sq > 1e-8 else 1e-4
+            inv_dist = 1.0 / dist
+            nx = sep_x * inv_dist
+            ny = sep_y * inv_dist
+
+            overlap = ball.radius - dist
+            ball.x += nx * overlap
+            ball.y += ny * overlap
+
+            vy = ball.y - ball.old_y
+            vn = vx * nx + vy * ny
+            if vn < 0.0:
+                refl_mag = -refl_factor * vn
+                ball.old_x -= nx * refl_mag
+                ball.old_y -= ny * refl_mag
+
     def _resolve_wall_collisions(self, balls: list[Ball], walls: list[WallSegment], sub_dt: float) -> None:
-        """Resolve dynamic ball collisions against angled and vertical rigid line-segment rails."""
+        """Resolve dynamic ball collisions against rigid line-segment walls."""
         if not balls or not walls:
             return
 
@@ -134,7 +363,6 @@ class PhysicsEngine:
                 wpx = bx - wall.x1
                 wpy = by - wall.y1
 
-                # Project ball center onto segment clamped to [0.0, 1.0]
                 t = (wpx * wall.dx + wpy * wall.dy) * wall.inv_len_sq
                 if t < 0.0:
                     t = 0.0
@@ -166,7 +394,6 @@ class PhysicsEngine:
                 ball.x += nx * overlap
                 ball.y += ny * overlap
 
-                # Reflect Verlet step velocity along collision normal
                 vx = ball.x - ball.old_x
                 vy = ball.y - ball.old_y
                 vn = vx * nx + vy * ny
@@ -176,7 +403,6 @@ class PhysicsEngine:
                     ball.old_x -= nx * refl_mag
                     ball.old_y -= ny * refl_mag
 
-                # Tangential surface friction
                 tx = -ny
                 ty = nx
                 vt = vx * tx + vy * ty
@@ -225,7 +451,7 @@ class PhysicsEngine:
                 ball.x += nx * overlap
                 ball.y += ny * overlap
 
-                pin.flash_timer = 0.12
+                pin.flash_timer = 0.14
 
                 vx = ball.x - ball.old_x
                 vy = ball.y - ball.old_y
@@ -243,45 +469,11 @@ class PhysicsEngine:
                 ball.old_x += tx * fric_shift
                 ball.old_y += ty * fric_shift
 
-    def _resolve_divider_collisions(self, balls: list[Ball], sub_dt: float) -> None:
-        """Confine balls to entered slot channels by resolving vertical dividers."""
-        y_top = 480.0
-
-        for ball in balls:
-            if ball.is_sleeping or ball.y < y_top - ball.radius:
-                continue
-
-            for div_x in self.divider_x_coords:
-                dx = ball.x - div_x
-                if abs(dx) >= ball.radius:
-                    continue
-
-                if ball.y >= y_top:
-                    if dx < 0.0:
-                        ball.x = div_x - ball.radius
-                        vx = ball.x - ball.old_x
-                        if vx > 0.0:
-                            ball.old_x = ball.x + self.restitution * vx
-                    else:
-                        ball.x = div_x + ball.radius
-                        vx = ball.x - ball.old_x
-                        if vx < 0.0:
-                            ball.old_x = ball.x - self.restitution * abs(vx)
-                else:
-                    dy = ball.y - y_top
-                    dist_sq = dx * dx + dy * dy
-                    if dist_sq < ball.radius * ball.radius:
-                        dist = math.sqrt(dist_sq) if dist_sq > 1e-8 else 1e-4
-                        nx = dx / dist
-                        ny = dy / dist
-                        overlap = ball.radius - dist
-                        ball.x += nx * overlap
-                        ball.y += ny * overlap
-
     def _resolve_boundary_collisions(self, balls: list[Ball], sub_dt: float) -> None:
         """Constrain bodies within screen bounds as fallback containment."""
         min_x = 0.0
         max_x = self.screen_width
+        max_y = self.screen_height + 40.0
 
         for ball in balls:
             if ball.is_sleeping:
@@ -368,20 +560,17 @@ class PhysicsEngine:
         ny = dy * inv_dist
         overlap = min_dist - dist
 
-        # Wake up sleeping partner on dynamic contact
         if b1.is_sleeping:
             b1.wake()
         if b2.is_sleeping:
             b2.wake()
 
-        # Positional displacement
         half_overlap = overlap * 0.5
         b1.x += nx * half_overlap
         b1.y += ny * half_overlap
         b2.x -= nx * half_overlap
         b2.y -= ny * half_overlap
 
-        # Restitution along normal
         v1x = b1.x - b1.old_x
         v1y = b1.y - b1.old_y
         v2x = b2.x - b2.old_x
@@ -398,7 +587,6 @@ class PhysicsEngine:
             b2.old_x += nx * refl_mag
             b2.old_y += ny * refl_mag
 
-        # Tangential surface friction
         tx = -ny
         ty = nx
         vt = rel_vx * tx + rel_vy * ty
@@ -410,7 +598,6 @@ class PhysicsEngine:
 
     def _update_sleep_states(self, balls: list[Ball], dt: float, sub_dt: float) -> None:
         """Update body dormancy timer and deactivate stationary entities."""
-        inv_sub_dt = 1.0 / sub_dt
         thresh_disp = self.sleep_speed_threshold * sub_dt
         thresh_disp_sq = thresh_disp * thresh_disp
 
